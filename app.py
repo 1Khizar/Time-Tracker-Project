@@ -80,13 +80,17 @@ def insert_entry(start_ts, end_ts, duration_minutes, category, topic, notes):
 
 def fetch_entries():
     conn = get_conn()
-    df = pd.read_sql_query("SELECT * FROM entries ORDER BY start_ts DESC", conn, parse_dates=["start_ts","end_ts","created_at"]) 
+    df = pd.read_sql_query(
+        "SELECT * FROM entries ORDER BY start_ts DESC",
+        conn,
+        parse_dates=["start_ts", "end_ts", "created_at"]
+    )
     conn.close()
     if df.empty:
         return df
-    df['start_ts'] = pd.to_datetime(df['start_ts'])
-    df['end_ts'] = pd.to_datetime(df['end_ts'])
-    df['created_at'] = pd.to_datetime(df['created_at'])
+    df['start_ts'] = pd.to_datetime(df['start_ts'], errors='coerce')
+    df['end_ts'] = pd.to_datetime(df['end_ts'], errors='coerce')
+    df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce')
     return df
 
 def update_entry(entry_id, **kwargs):
@@ -130,10 +134,14 @@ def get_setting(key, default=None):
 # ---------------------------
 # Helper functions for streaks and stats
 # ---------------------------
+
 def calculate_daily_streak(df):
     if df.empty:
         return 0
-    dates = sorted(set(df['start_ts'].dt.date))
+    valid_dates = df['start_ts'].dropna().dt.date
+    if valid_dates.empty:
+        return 0
+    dates = sorted(set(valid_dates))
     streak = 0
     today = date.today()
     for i in range(len(dates)-1, -1, -1):
@@ -147,7 +155,10 @@ def calculate_daily_streak(df):
 def calculate_weekly_streak(df):
     if df.empty:
         return 0
-    weeks = sorted(set(df['start_ts'].dt.to_period('W').apply(lambda r: r.start_time.date())))
+    valid_weeks = df['start_ts'].dropna().dt.to_period('W').dt.start_time.dt.date
+    if valid_weeks.empty:
+        return 0
+    weeks = sorted(set(valid_weeks))
     streak = 0
     this_week = (date.today() - timedelta(days=date.today().weekday()))  # Monday this week
     for i in range(len(weeks)-1, -1, -1):
@@ -161,7 +172,10 @@ def calculate_weekly_streak(df):
 def calculate_monthly_streak(df):
     if df.empty:
         return 0
-    months = sorted(set(df['start_ts'].dt.to_period('M').dt.to_timestamp().dt.date))
+    valid_months = df['start_ts'].dropna().dt.to_period('M').dt.to_timestamp().dt.date
+    if valid_months.empty:
+        return 0
+    months = sorted(set(valid_months))
     streak = 0
     today = date.today()
     current_month_start = today.replace(day=1)
@@ -213,8 +227,10 @@ df_all = fetch_entries()
 
 # Prepare date columns if not empty
 if not df_all.empty:
+    # Drop rows with missing start_ts to avoid NaT errors
+    df_all = df_all.dropna(subset=['start_ts'])
     df_all['date'] = df_all['start_ts'].dt.date
-    df_all['week'] = df_all['start_ts'].dt.to_period('W').apply(lambda r: r.start_time.date())
+    df_all['week'] = df_all['start_ts'].dt.to_period('W').dt.start_time.dt.date
     df_all['year_month'] = df_all['start_ts'].dt.to_period('M').dt.to_timestamp().dt.date
 
 # --- Dashboard at top ---
@@ -426,48 +442,70 @@ with col1:
                     st.session_state['elapsed_paused'] += datetime.now() - st.session_state['pause_start']
                     st.session_state['paused'] = False
                     st.session_state['pause_start'] = None
+
         with colp2:
-            if st.button("Stop Timer"):
-                if not st.session_state['paused']:
-                    end_time = datetime.now()
-                else:
+            if st.button("Stop & Save"):
+                end_time = datetime.now()
+                if st.session_state['paused']:
+                    # Adjust end time if paused
                     end_time = st.session_state['pause_start']
-                start_ts = st.session_state['start_time'].isoformat()
-                end_ts = end_time.isoformat()
-                duration_mins = (end_time - st.session_state['start_time'] - st.session_state['elapsed_paused']).total_seconds() / 60.0
-                insert_entry(start_ts, end_ts, duration_mins, st.session_state['start_category'], st.session_state['start_topic'], st.session_state.get('start_notes',''))
+                duration = (end_time - st.session_state['start_time'] - st.session_state['elapsed_paused']).total_seconds() / 60.0
+                if duration > 0:
+                    insert_entry(
+                        st.session_state['start_time'].isoformat(),
+                        end_time.isoformat(),
+                        duration,
+                        st.session_state['start_category'],
+                        st.session_state['start_topic'],
+                        st.session_state['start_notes']
+                    )
+                    st.success(f"Saved entry: {st.session_state['start_category']} for {int(duration)} minutes.")
+                else:
+                    st.warning("Duration is too short, not saved.")
+
+                # Reset timer session state
                 st.session_state['running'] = False
                 st.session_state['paused'] = False
                 st.session_state['start_time'] = None
                 st.session_state['elapsed_paused'] = timedelta(0)
                 st.session_state['pause_start'] = None
-                st.success(f"Stopped — recorded {duration_mins:.2f} minutes")
+                st.session_state['start_category'] = None
+                st.session_state['start_topic'] = None
+                st.session_state['start_notes'] = None
+                st.experimental_rerun()
+
         with colp3:
-            if st.button("Reset Timer"):
+            if st.button("Cancel"):
                 st.session_state['running'] = False
                 st.session_state['paused'] = False
                 st.session_state['start_time'] = None
                 st.session_state['elapsed_paused'] = timedelta(0)
                 st.session_state['pause_start'] = None
-                st.success("Timer reset.")
+                st.session_state['start_category'] = None
+                st.session_state['start_topic'] = None
+                st.session_state['start_notes'] = None
+                st.info("Timer cancelled.")
+                st.experimental_rerun()
 
 with col2:
-    st.subheader("✍️ Quick Manual Entry")
-    with st.form('manual_form'):
-        m_category = st.selectbox('Category (manual)', options=cats, index=0, key='mcat')
-        m_topic = st.text_input('Topic (manual)', key='mtop')
-        m_minutes = st.number_input('Minutes', min_value=1, value=30, key='mmins')
-        m_date = st.date_input('Date', value=date.today(), key='mdate')
-        m_notes = st.text_area('Notes (manual)', key='mnotes')
-        submit_manual = st.form_submit_button('Add Manual Entry')
+    st.subheader("➕ Manual Entry")
+    with st.form(key='manual_form'):
+        m_start_date = st.date_input("Start Date", value=datetime.now())
+        m_start_time = st.time_input("Start Time", value=datetime.now().time())
+        m_end_date = st.date_input("End Date", value=datetime.now())
+        m_end_time = st.time_input("End Time", value=datetime.now().time())
+        m_category = st.selectbox("Category", options=cats, index=0)
+        m_topic = st.text_input("Topic (optional)")
+        m_notes = st.text_area("Notes (optional)")
+        submit_manual = st.form_submit_button("Add Entry")
 
     if submit_manual:
-        start_dt = datetime.combine(m_date, datetime.now().time())
-        end_dt = start_dt + timedelta(minutes=int(m_minutes))
-        insert_entry(start_dt.isoformat(), end_dt.isoformat(), float(m_minutes), m_category, m_topic, m_notes)
-        st.success('Manual entry added')
-
-# Footer
-st.markdown('---')
-st.caption('Tip: Keep this app running while you work and press Stop when finished. Manual entries are useful for retroactive logging.')
-st.caption('Want authentication, cloud DB, or mobile notifications? Just ask, I can help extend it.')
+        start_dt = datetime.combine(m_start_date, m_start_time)
+        end_dt = datetime.combine(m_end_date, m_end_time)
+        duration = (end_dt - start_dt).total_seconds() / 60.0
+        if duration <= 0:
+            st.error("End time must be after start time.")
+        else:
+            insert_entry(start_dt.isoformat(), end_dt.isoformat(), duration, m_category, m_topic, m_notes)
+            st.success(f"Manual entry added: {m_category} for {int(duration)} minutes.")
+            st.experimental_rerun()
